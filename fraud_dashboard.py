@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import joblib
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -220,11 +223,7 @@ with col2:
 # ---------------------------------------------------------------------------
 # Amount distribution by chargeback status
 # ---------------------------------------------------------------------------
-# NOTE: px.histogram's log_x=True bins the raw values *linearly* and only
-# switches the axis to log scale afterward, which for a wide-ranging amount
-# column ($1-$4k) blows up the auto-range and renders as a blank chart.
-# Binning on log10(amount) directly avoids that, then we relabel the ticks
-# back to dollar amounts.
+
 df_hist = df.copy()
 df_hist["log_amount"] = np.log10(df_hist["transaction_amount"])
 
@@ -350,6 +349,135 @@ if clusters:
     st.caption("🔵 User · 🟢 Device · 🔴 Card")
 else:
     st.info("No clusters match the current thresholds — try lowering the minimums above.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# ML risk scoring (Step 4 / Layer 2 of the report)
+# ---------------------------------------------------------------------------
+st.subheader("🎯 ML Risk Scoring — Layer 2")
+st.caption(
+    "Gradient-boosted trees model trained on the engineered feature store "
+    "(`fs_transactional_data.csv`), scoring each transaction with a continuous "
+    "risk score and routing it to one of three tiers instead of a single hard "
+    "cutoff. Train with `python train_risk_model.py`."
+)
+
+MODEL_PATH = Path("risk_model.joblib")
+SCORES_PATH = Path("risk_scores_test.csv")
+
+if not MODEL_PATH.exists() or not SCORES_PATH.exists():
+    st.warning(
+        "No trained model found yet. Run `python train_risk_model.py` in this folder "
+        "to train the model and generate `risk_model.joblib` / `risk_scores_test.csv`, "
+        "then reload this page."
+    )
+else:
+    @st.cache_resource
+    def load_model(path: Path):
+        return joblib.load(path)
+
+    @st.cache_data
+    def load_scores(path: Path) -> pd.DataFrame:
+        s = pd.read_csv(path)
+        s["transaction_date"] = pd.to_datetime(s["transaction_date"])
+        s["bin"] = s["card_number"].astype(str).str[:6]
+        return s
+
+    bundle = load_model(MODEL_PATH)
+    scores_df = load_scores(SCORES_PATH)
+    low_thr, high_thr = bundle["low_threshold"], bundle["high_threshold"]
+
+    if merchant_sel != "All":
+        scores_df = scores_df[scores_df["merchant_id"] == merchant_sel]
+    if bin_sel != "All":
+        scores_df = scores_df[scores_df["bin"] == bin_sel]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Held-out test transactions", f"{bundle['test_size']:,}")
+    m1.caption("Most recent 20% of transactions by date — never seen during training")
+    m2.metric("ROC-AUC", f"{bundle['test_roc_auc']:.3f}")
+    m3.metric("PR-AUC", f"{bundle['test_pr_auc']:.3f}", help=f"Baseline (random) = {bundle['test_cbk_rate']:.3f}")
+    m4.metric("Tier thresholds", f"{low_thr:.2f} / {high_thr:.2f}")
+
+    if scores_df.empty:
+        st.info("No held-out transactions match the current Merchant/BIN filter.")
+    else:
+        left, right = st.columns([3, 2])
+
+        with left:
+            fig_score = px.histogram(
+                scores_df,
+                x="risk_score",
+                color="has_cbk",
+                nbins=40,
+                barmode="overlay",
+                opacity=0.65,
+                range_x=[0, 1],
+                color_discrete_map={True: "crimson", False: "steelblue"},
+                labels={"has_cbk": "Chargeback", "risk_score": "Model risk score"},
+                title="Risk Score Distribution (held-out test set)",
+            )
+            fig_score.add_vline(x=low_thr, line_dash="dash", line_color="orange",
+                                 annotation_text="auto-approve / step-up")
+            fig_score.add_vline(x=high_thr, line_dash="dash", line_color="crimson",
+                                 annotation_text="step-up / decline")
+            st.plotly_chart(fig_score, width='stretch')
+
+        with right:
+            tier_order = ["Auto-approve", "Step-up authentication", "Manual review / decline"]
+            tier_summary = (
+                scores_df.groupby("tier")["has_cbk"]
+                .agg(transactions="count", chargeback_rate="mean")
+                .reindex(tier_order)
+                .dropna(how="all")
+                .reset_index()
+            )
+            fig_tier = px.bar(
+                tier_summary,
+                x="tier",
+                y="chargeback_rate",
+                text="transactions",
+                color="tier",
+                color_discrete_map={
+                    "Auto-approve": "#2ca02c",
+                    "Step-up authentication": "#ff9f1c",
+                    "Manual review / decline": "#d62728",
+                },
+                title="Chargeback Rate by Decision Tier",
+                labels={"chargeback_rate": "Chargeback rate", "tier": ""},
+            )
+            fig_tier.update_traces(texttemplate="%{text} txns", textposition="outside")
+            fig_tier.update_yaxes(tickformat=".0%")
+            fig_tier.update_layout(showlegend=False, margin=dict(t=60))
+            st.plotly_chart(fig_tier, width='stretch')
+
+        fig_imp = px.bar(
+            bundle["feature_importance"].head(10).sort_values("importance"),
+            x="importance",
+            y="feature",
+            orientation="h",
+            title="Top 10 Features (permutation importance, scored on PR-AUC)",
+            labels={"importance": "Importance (PR-AUC drop)", "feature": ""},
+        )
+        fig_imp.update_layout(margin=dict(t=60))
+        st.plotly_chart(fig_imp, width='stretch')
+
+        st.markdown("**Scored transactions (held-out test set)**")
+        tier_filter = st.multiselect(
+            "Show tiers", options=tier_order, default=tier_order, key="ml_tier_filter"
+        )
+        display_cols = [
+            "transaction_id", "transaction_date", "merchant_id", "user_id",
+            "transaction_amount", "risk_score", "tier", "has_cbk",
+        ]
+        table = (
+            scores_df[scores_df["tier"].isin(tier_filter)][display_cols]
+            .sort_values("risk_score", ascending=False)
+            .reset_index(drop=True)
+        )
+        table["risk_score"] = table["risk_score"].round(3)
+        st.dataframe(table, width='stretch', hide_index=True)
 
 st.divider()
 st.caption("Data: transactional-sample.csv · Companion dashboard to the REPORT case-study deliverable.")
