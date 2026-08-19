@@ -104,8 +104,7 @@ if bin_sel != "All":
 # ---------------------------------------------------------------------------
 st.title("🛡️ Fraud & Chargeback Analysis Dashboard")
 st.caption(
-    "Interactive companion to **Step 5 — Present your results** of the case-study report "
-    "(`REPORT.md` / `REPORT.pdf`). Same EDA, explorable live."
+ "Same EDA, explorable live."
 )
 
 if df.empty:
@@ -221,17 +220,32 @@ with col2:
 # ---------------------------------------------------------------------------
 # Amount distribution by chargeback status
 # ---------------------------------------------------------------------------
+# NOTE: px.histogram's log_x=True bins the raw values *linearly* and only
+# switches the axis to log scale afterward, which for a wide-ranging amount
+# column ($1-$4k) blows up the auto-range and renders as a blank chart.
+# Binning on log10(amount) directly avoids that, then we relabel the ticks
+# back to dollar amounts.
+df_hist = df.copy()
+df_hist["log_amount"] = np.log10(df_hist["transaction_amount"])
+
 fig_hist = px.histogram(
-    df,
-    x="transaction_amount",
+    df_hist,
+    x="log_amount",
     color="has_cbk",
     nbins=60,
-    log_x=True,
     barmode="overlay",
     opacity=0.65,
     color_discrete_map={True: "crimson", False: "steelblue"},
-    labels={"has_cbk": "Chargeback", "transaction_amount": "Amount ($, log scale)"},
+    labels={"has_cbk": "Chargeback", "log_amount": "Amount ($, log scale)"},
     title="Transaction Amount Distribution by Chargeback Status",
+)
+
+tick_dollars = [1, 5, 10, 50, 100, 500, 1000, 5000]
+min_amt, max_amt = df["transaction_amount"].min(), df["transaction_amount"].max()
+tick_dollars = [v for v in tick_dollars if min_amt * 0.8 <= v <= max_amt * 1.2]
+fig_hist.update_xaxes(
+    tickvals=[np.log10(v) for v in tick_dollars],
+    ticktext=[f"${v:,.0f}" for v in tick_dollars],
 )
 st.plotly_chart(fig_hist, width='stretch')
 
